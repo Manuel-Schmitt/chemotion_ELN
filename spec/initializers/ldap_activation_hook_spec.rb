@@ -72,21 +72,21 @@ end
 
 describe LdapMembershipCheck do
   describe '.enabled?' do
-    it 'is true when host, base and activation filter are present' do
+    it 'is true when host, base and activation group dn are present' do
       stub_const('ENV', ENV.to_hash.merge(
                           'LDAP_HOST' => 'ldap.example.org',
                           'LDAP_BASE' => 'dc=example,dc=org',
-                          'LDAP_ACTIVATION_FILTER' => '(sAMAccountName=%<uid>s)',
+                          'LDAP_ACTIVATION_GROUP_DN' => 'cn=eln-users,ou=groups,dc=example,dc=org',
                         ))
 
       expect(described_class.enabled?).to be(true)
     end
 
-    it 'is false when the activation filter is missing' do
+    it 'is false when the activation group dn is missing' do
       stub_const('ENV', ENV.to_hash.merge(
                           'LDAP_HOST' => 'ldap.example.org',
                           'LDAP_BASE' => 'dc=example,dc=org',
-                          'LDAP_ACTIVATION_FILTER' => nil,
+                          'LDAP_ACTIVATION_GROUP_DN' => nil,
                         ))
 
       expect(described_class.enabled?).to be(false)
@@ -100,14 +100,12 @@ describe LdapMembershipCheck do
       stub_const('ENV', ENV.to_hash.merge(
                           'LDAP_HOST' => 'ldap.example.org',
                           'LDAP_BASE' => 'dc=example,dc=org',
-                          'LDAP_ACTIVATION_FILTER' =>
-                            '(&(sAMAccountName=%<uid>s)(memberOf:1.2.840.113556.1.4.1941:=' \
-                            'cn=eln-users,ou=groups,dc=example,dc=org))',
+                          'LDAP_ACTIVATION_GROUP_DN' => 'cn=eln-users,ou=groups,dc=example,dc=org',
                         ))
       allow(Net::LDAP).to receive(:new).and_return(connection)
     end
 
-    it 'substitutes the escaped uid into the configured filter and returns true on a match' do
+    it 'matches uid against the configured group, resolving nested groups' do
       allow(connection).to receive(:search).and_return([{ dn: 'cn=jdoe,dc=example,dc=org' }])
 
       expect(described_class.member?('jdoe')).to be(true)
@@ -120,7 +118,7 @@ describe LdapMembershipCheck do
       )
     end
 
-    it 'returns false when the filter matches no entry' do
+    it 'returns false when no entry matches' do
       allow(connection).to receive(:search).and_return([])
 
       expect(described_class.member?('jdoe')).to be(false)
@@ -133,15 +131,65 @@ describe LdapMembershipCheck do
 
       expect(connection).to have_received(:search).with(
         hash_including(filter: Net::LDAP::Filter.construct(
-          '(&(sAMAccountName=jdoe\28\29\28uid=\2a)(memberOf:1.2.840.113556.1.4.1941:=' \
+          '(&(sAMAccountName=jdoe\29\28uid=\2A)(memberOf:1.2.840.113556.1.4.1941:=' \
           'cn=eln-users,ou=groups,dc=example,dc=org))',
         )),
       )
     end
 
     it 'returns false without querying when uid is blank' do
+      allow(connection).to receive(:search)
+
       expect(described_class.member?('')).to be(false)
       expect(connection).not_to have_received(:search)
+    end
+
+    it 'uses LDAP_UID_ATTRIBUTE instead of the sAMAccountName default when configured' do
+      stub_const('ENV', ENV.to_hash.merge('LDAP_UID_ATTRIBUTE' => 'uid'))
+      allow(connection).to receive(:search).and_return([])
+
+      described_class.member?('jdoe')
+
+      expect(connection).to have_received(:search).with(
+        hash_including(filter: Net::LDAP::Filter.construct(
+          '(&(uid=jdoe)(memberOf:1.2.840.113556.1.4.1941:=cn=eln-users,ou=groups,dc=example,dc=org))',
+        )),
+      )
+    end
+  end
+
+  describe '.members' do
+    let(:connection) { instance_double(Net::LDAP) }
+
+    before do
+      stub_const('ENV', ENV.to_hash.merge(
+                          'LDAP_HOST' => 'ldap.example.org',
+                          'LDAP_BASE' => 'dc=example,dc=org',
+                          'LDAP_ACTIVATION_GROUP_DN' => 'cn=eln-users,ou=groups,dc=example,dc=org',
+                        ))
+      allow(Net::LDAP).to receive(:new).and_return(connection)
+    end
+
+    it 'runs a single wildcard, paged query and returns the downcased uid of every match' do
+      allow(connection).to receive(:search).and_return(
+        [{ 'sAMAccountName' => ['JDoe'] }, { 'sAMAccountName' => ['ASmith'] }],
+      )
+
+      expect(described_class.members).to eq(Set['jdoe', 'asmith'])
+      expect(connection).to have_received(:search).with(
+        base: 'dc=example,dc=org',
+        filter: Net::LDAP::Filter.construct(
+          '(&(sAMAccountName=*)(memberOf:1.2.840.113556.1.4.1941:=cn=eln-users,ou=groups,dc=example,dc=org))',
+        ),
+        attributes: ['sAMAccountName'],
+        paged_searches: true,
+      )
+    end
+
+    it 'returns an empty set when no entry matches' do
+      allow(connection).to receive(:search).and_return([])
+
+      expect(described_class.members).to eq(Set.new)
     end
   end
 end
