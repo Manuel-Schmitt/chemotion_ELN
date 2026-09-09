@@ -69,6 +69,7 @@ gem 'mime-types'
 # locked to enforce latest version of net-scp. without lock net-ssh would be updated first which locks
 # out newer net-scp versions
 gem 'net-scp', '3.0.0'
+gem 'net-ldap'
 gem 'net-sftp'
 gem 'net-ssh'
 gem 'nokogiri'
