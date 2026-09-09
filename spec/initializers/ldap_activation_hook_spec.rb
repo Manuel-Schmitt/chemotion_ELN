@@ -112,9 +112,11 @@ describe LdapMembershipCheck do
       expect(connection).to have_received(:search).with(
         base: 'dc=example,dc=org',
         filter: Net::LDAP::Filter.construct(
-          '(&(sAMAccountName=jdoe)(memberOf:1.2.840.113556.1.4.1941:=cn=eln-users,ou=groups,dc=example,dc=org))',
+          '(&(sAMAccountName=jdoe)(objectClass=user)(objectCategory=person)' \
+          '(memberOf:1.2.840.113556.1.4.1941:=cn=eln-users,ou=groups,dc=example,dc=org))',
         ),
         attributes: ['dn'],
+        paged_searches: false,
       )
     end
 
@@ -131,8 +133,8 @@ describe LdapMembershipCheck do
 
       expect(connection).to have_received(:search).with(
         hash_including(filter: Net::LDAP::Filter.construct(
-          '(&(sAMAccountName=jdoe\29\28uid=\2A)(memberOf:1.2.840.113556.1.4.1941:=' \
-          'cn=eln-users,ou=groups,dc=example,dc=org))',
+          '(&(sAMAccountName=jdoe\29\28uid=\2A)(objectClass=user)(objectCategory=person)' \
+          '(memberOf:1.2.840.113556.1.4.1941:=cn=eln-users,ou=groups,dc=example,dc=org))',
         )),
       )
     end
@@ -152,9 +154,17 @@ describe LdapMembershipCheck do
 
       expect(connection).to have_received(:search).with(
         hash_including(filter: Net::LDAP::Filter.construct(
-          '(&(uid=jdoe)(memberOf:1.2.840.113556.1.4.1941:=cn=eln-users,ou=groups,dc=example,dc=org))',
+          '(&(uid=jdoe)(objectClass=user)(objectCategory=person)' \
+          '(memberOf:1.2.840.113556.1.4.1941:=cn=eln-users,ou=groups,dc=example,dc=org))',
         )),
       )
+    end
+
+    it 'raises when the search fails without itself raising (e.g. a bind failure)' do
+      operation_result = Struct.new(:message).new('Invalid Credentials')
+      allow(connection).to receive_messages(search: nil, get_operation_result: operation_result)
+
+      expect { described_class.member?('jdoe') }.to raise_error(Net::LDAP::Error, 'Invalid Credentials')
     end
   end
 
@@ -179,17 +189,32 @@ describe LdapMembershipCheck do
       expect(connection).to have_received(:search).with(
         base: 'dc=example,dc=org',
         filter: Net::LDAP::Filter.construct(
-          '(&(sAMAccountName=*)(memberOf:1.2.840.113556.1.4.1941:=cn=eln-users,ou=groups,dc=example,dc=org))',
+          '(&(objectClass=user)(objectCategory=person)' \
+          '(memberOf:1.2.840.113556.1.4.1941:=cn=eln-users,ou=groups,dc=example,dc=org))',
         ),
         attributes: ['sAMAccountName'],
         paged_searches: true,
       )
     end
 
+    it 'returns an empty set when an entry lacks the uid attribute' do
+      allow(connection).to receive(:search).and_return([{ 'sAMAccountName' => [] }, {}])
+
+      expect(described_class.members).to eq(Set.new)
+    end
+
     it 'returns an empty set when no entry matches' do
       allow(connection).to receive(:search).and_return([])
 
       expect(described_class.members).to eq(Set.new)
+    end
+
+    it 'raises when the search fails without itself raising (e.g. a bind failure), rather than ' \
+       'returning an empty set that would read as "nobody is a member"' do
+      operation_result = Struct.new(:message).new('Invalid Credentials')
+      allow(connection).to receive_messages(search: nil, get_operation_result: operation_result)
+
+      expect { described_class.members }.to raise_error(Net::LDAP::Error, 'Invalid Credentials')
     end
   end
 end
