@@ -1,17 +1,9 @@
 # frozen_string_literal: true
 
-# Periodically re-verifies every Person's LDAP/AD group membership (see
-# config/initializers/ldap_activation_hook.rb) and flips account_active accordingly: a member
-# who is currently disabled gets activated, and a previously-approved member who has since left
-# the group gets disabled. Runs every even hour (00:00, 02:00, ... 22:00).
-#
-# Applies to every Person, not just accounts created through the LDAP-gated registration flow -
-# any Person whose LDAP_ACCOUNT_ATTRIBUTE value is no longer a member of LDAP_ACTIVATION_GROUP_DN
-# will be disabled on the next sweep.
-#
-# Self-registers as a delayed_cron_job recurring job (the same mechanism
-# config/initializers/delayed_job_config.rb / InitCronJobsJob use for the app's other recurring
-# jobs), without touching either of those files.
+# Periodically re-verifies every Person's LDAP/AD group membership and flips account_active accordingly:
+# Runs every even hour (00:00, 02:00, ... 22:00).
+# Applies to every Person
+# Self-registers as a delayed_cron_job recurring job.
 class LdapPeriodicRecheckJob < ApplicationJob
   queue_as :default
 
@@ -21,9 +13,13 @@ class LdapPeriodicRecheckJob < ApplicationJob
     return unless LdapMembershipCheck.enabled?
 
     account_attribute = ENV['LDAP_ACCOUNT_ATTRIBUTE'].presence || 'name_abbreviation'
-    # One query for the whole group instead of one per user (LdapMembershipCheck.member? would
-    # otherwise be called once per Person).
     members = LdapMembershipCheck.members
+    if members.blank?
+      # A successful-but-empty result is indistinguishable from a misconfigured/renamed
+      # LDAP_ACTIVATION_GROUP_DN; skip rather than risk deactivating every active Person.
+      Rails.logger.warn('LDAP periodic recheck: group query returned no members, skipping this run')
+      return
+    end
 
     User.persons.find_each { |user| sync_account_active!(user, account_attribute, members) }
   rescue Net::LDAP::Error => e
@@ -42,8 +38,7 @@ class LdapPeriodicRecheckJob < ApplicationJob
   end
 end
 
-# Self-schedule via delayed_cron_job's cron support (the same mechanism InitCronJobsJob uses for
-# the app's other recurring jobs), without touching config/initializers/delayed_job_config.rb.
+# Self-schedule via delayed_cron_job's cron support 
 ActiveSupport.on_load(:active_record) do
   next unless ActiveRecord::Base.connection.table_exists?('delayed_jobs') && Delayed::Job.column_names.include?('cron')
 
