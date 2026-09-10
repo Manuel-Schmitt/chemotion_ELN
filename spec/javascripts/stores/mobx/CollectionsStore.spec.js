@@ -6,6 +6,7 @@ import { Collection } from 'src/stores/mobx/CollectionsStore';
 import ElementActions from 'src/stores/alt/actions/ElementActions';
 import CollectionElementsFetcher from 'src/fetchers/CollectionElementsFetcher';
 import CollectionsFetcher from 'src/fetchers/CollectionsFetcher';
+import CollectionSharesFetcher from 'src/fetchers/CollectionSharesFetcher';
 
 // Pins removeElementsFromCollection's return contract { success, lockedSampleIds }. moveElementsToCollection
 // and the lock toast both branch on it, and the fetcher's return-shape change (boolean -> object|null|
@@ -110,6 +111,48 @@ describe('CollectionsStore', () => {
 
       expect(result).toBe(false);
       expect(store.own_collections.map((c) => c.label)).toEqual(['Original']);
+    });
+  });
+
+  // Regression coverage: apply_to_subcollections/include_new_subcollections can cascade an edit
+  // onto descendants not previously shared, but PUT's response only ever carries the one edited
+  // share — never the cascade's effect on those descendants' `shared` flag — so own_collections
+  // has to be refetched to pick it up, the same way addCollectionShare/deleteCollectionShare
+  // already do. Without this, the owner's own tree kept showing newly-cascaded subcollections as
+  // unshared until a page reload.
+  describe('.updateCollectionShare', () => {
+    let updateStub;
+    let fetchCollectionsStub;
+    let getSharedWithUsersStub;
+
+    beforeEach(() => {
+      updateStub = sinon.stub(CollectionSharesFetcher, 'updateCollectionShare');
+      fetchCollectionsStub = sinon.stub(CollectionsFetcher, 'fetchCollections').resolves({ own: [], shared_with_me: [] });
+      // Unrelated to what this action's tested for — stubbed only so the store's own
+      // getSharedWithUsers call doesn't attempt a real network request in this environment.
+      getSharedWithUsersStub = sinon.stub(CollectionSharesFetcher, 'getCollectionSharedWithUsers').resolves([]);
+    });
+
+    afterEach(() => {
+      updateStub.restore();
+      fetchCollectionsStub.restore();
+      getSharedWithUsersStub.restore();
+    });
+
+    it('refetches collections on a successful update', async () => {
+      updateStub.resolves({ collection_id: 1 });
+
+      await store.updateCollectionShare(7, { permission_level: 1, apply_to_subcollections: true });
+
+      expect(fetchCollectionsStub.called).toBe(true);
+    });
+
+    it('does not refetch when the update fails (falsy response)', async () => {
+      updateStub.resolves(undefined);
+
+      await store.updateCollectionShare(7, { permission_level: 1 });
+
+      expect(fetchCollectionsStub.called).toBe(false);
     });
   });
 
@@ -291,6 +334,82 @@ describe('CollectionsStore', () => {
     });
   });
 
+  // Ownership is personal and singular: Collection#owned_by? is `user_id == user.id`, and the
+  // `own` payload is every collection with that user_id. Holding the repository subtree on its own
+  // field is a rendering concern for the sidebar - it must not shrink what the user owns, or
+  // features gated on isOwnCollection silently switch off inside the repository section.
+  describe('.ownCollectionIds', () => {
+    const repositoryRoot = {
+      id: 1, label: 'chemotion-repository.net', ancestry: '/', position: null, is_locked: true,
+    };
+    const transferred = {
+      id: 3, label: 'transferred', ancestry: '/1/', position: null, is_locked: false,
+    };
+    const ordinary = {
+      id: 4, label: 'Project', ancestry: '/', position: null, is_locked: false,
+    };
+
+    it('counts the repository subtree as own even though it is held off own_collections', () => {
+      store.setOwnCollections([repositoryRoot, transferred, ordinary]);
+
+      expect(store.own_collections.map((c) => c.id)).toEqual([4]);
+      expect(store.ownCollectionIds.slice().sort()).toEqual([1, 3, 4]);
+      expect(store.isOwnCollection(1)).toBe(true);
+      expect(store.isOwnCollection(3)).toBe(true);
+    });
+
+    it('reports no repository ids when the user has no repository subtree', () => {
+      store.setOwnCollections([ordinary]);
+
+      expect(store.ownCollectionIds).toEqual([4]);
+      expect(store.isOwnCollection(3)).toBe(false);
+    });
+  });
+
+  describe('.systemCollections', () => {
+    const allCollection = {
+      id: 9, label: 'All', ancestry: '/', position: 0, is_locked: true,
+    };
+    const repositoryRoot = {
+      id: 1, label: 'chemotion-repository.net', ancestry: '/', position: 1, is_locked: true,
+    };
+    const transferred = {
+      id: 3, label: 'transferred', ancestry: '/1/', position: null, is_locked: true,
+    };
+    const ordinary = {
+      id: 4, label: 'Project', ancestry: '/', position: null, is_locked: false,
+    };
+
+    it('lists the three system collections in presentation order', () => {
+      store.setOwnCollections([ordinary, transferred, repositoryRoot, allCollection]);
+
+      expect(store.systemCollections.map((c) => c.label))
+        .toEqual(['All', 'chemotion-repository.net', 'transferred']);
+    });
+
+    it('omits system collections the user does not have', () => {
+      store.setOwnCollections([allCollection, ordinary]);
+
+      expect(store.systemCollections.map((c) => c.id)).toEqual([9]);
+    });
+
+    // The label alone is not reserved: a user may create an ordinary collection called "All".
+    it('ignores an unlocked collection that merely shares a system label', () => {
+      store.setOwnCollections([{ ...allCollection, id: 10, is_locked: false }]);
+
+      expect(store.systemCollections).toEqual([]);
+      expect(store.own_collections.map((c) => c.id)).toEqual([10]);
+    });
+
+    it('resolves the "All" collection by id, which no tree can reach', () => {
+      store.setOwnCollections([allCollection, ordinary]);
+
+      expect(store.isAllCollectionId(9)).toBe(true);
+      expect(store.isAllCollectionId(4)).toBe(false);
+      expect(store.find(9)).toBe(null);
+    });
+  });
+
   describe('.addCollectionToTree', () => {
     it('shows a collection whose parent is missing without rewriting its ancestry', () => {
       const orphan = Collection.create({
@@ -301,6 +420,142 @@ describe('CollectionsStore', () => {
 
       expect(store.own_collections.map((c) => c.id)).toEqual([9]);
       expect(store.own_collections[0].ancestry).toEqual('/1/');
+    });
+  });
+
+  // Regression coverage: a collection-share notification (create/update/revoke/rename) only ever
+  // called fetchCollections(), which never touches my_collection_shares — so a sharee's permission-level
+  // tooltip stayed stale after a live permission change even though the tree itself refreshed
+  // correctly. This is the sibling refresh NoticeButton.js now calls alongside fetchCollections().
+  describe('.refreshMySharedCollectionShares', () => {
+    let getMySharesStub;
+
+    // SharedWithUser's MST model requires every detail-level column plus shared_with(_id/_type) —
+    // only permission_level varies across these fixtures.
+    const sharedWithUser = (permissionLevel) => ({
+      id: 101,
+      celllinesample_detail_level: 0,
+      devicedescription_detail_level: 0,
+      element_detail_level: 0,
+      permission_level: permissionLevel,
+      reaction_detail_level: 0,
+      researchplan_detail_level: 0,
+      sample_detail_level: 0,
+      screen_detail_level: 0,
+      sequencebasedmacromoleculesample_detail_level: 0,
+      shared_with: 'Some User',
+      shared_with_id: 1,
+      shared_with_type: 'Person',
+      wellplate_detail_level: 0,
+    });
+
+    beforeEach(() => {
+      getMySharesStub = sinon.stub(CollectionSharesFetcher, 'getMyCollectionShares');
+    });
+
+    afterEach(() => {
+      getMySharesStub.restore();
+    });
+
+    it('re-fetches shares only for collection ids already cached, updating them in place', async () => {
+      getMySharesStub.withArgs(1).resolves([sharedWithUser(1)]);
+      getMySharesStub.withArgs(2).resolves([sharedWithUser(3)]);
+      // Seed the cache the way getMySharesFor itself would (called once per id already).
+      await store.getMySharesFor(1);
+      await store.getMySharesFor(2);
+      getMySharesStub.resetHistory();
+      getMySharesStub.withArgs(1).resolves([sharedWithUser(9)]);
+
+      await store.refreshMySharedCollectionShares();
+
+      expect(getMySharesStub.calledWith(1)).toBe(true);
+      expect(getMySharesStub.calledWith(2)).toBe(true);
+      expect(store.mySharesFor(1).shared_with_users[0].permission_level).toBe(9);
+    });
+
+    it('is a no-op when nothing has been cached yet', async () => {
+      await store.refreshMySharedCollectionShares();
+
+      expect(getMySharesStub.called).toBe(false);
+    });
+  });
+
+  // Regression coverage for the nearest-shared-ancestor "adoption" fix: a node whose real parent
+  // isn't shared used to have its ENTIRE ancestry wiped to root (discarding a closer surviving
+  // shared ancestor), and — for two or more levels of shared descendants below such a gap — could
+  // throw inside fetchCollections entirely (undefined.addChild), per the traced A/B/C/D scenario.
+  describe('.setSharedWithMeCollections', () => {
+    const sharedCollection = (overrides) => ({
+      is_locked: false, owner: 'Alice', owner_name: 'Alice', position: 1, ...overrides,
+    });
+
+    it('adopts a node under its nearest shared ancestor when the direct parent is not shared', () => {
+      // A (shared, root) -> B (id 2, NOT shared) -> C (shared) -> D (shared)
+      const a = sharedCollection({ id: 1, label: 'A', ancestry: '/' });
+      const c = sharedCollection({ id: 3, label: 'C', ancestry: '/1/2/' });
+      const d = sharedCollection({ id: 4, label: 'D', ancestry: '/1/2/3/' });
+
+      store.setSharedWithMeCollections([a, c, d]);
+
+      const ownerRoot = store.shared_with_me_collections[0];
+      expect(ownerRoot.children.map((node) => node.id)).toEqual([1]);
+      const nodeA = ownerRoot.children[0];
+      expect(nodeA.children.map((node) => node.id)).toEqual([3]);
+      const nodeC = nodeA.children[0];
+      expect(nodeC.children.map((node) => node.id)).toEqual([4]);
+    });
+
+    // Regression coverage for the sibling-ordering refinement: position is only comparable among
+    // true original siblings. 33-37 are true siblings under /31/32/ (32 unshared); 45 (ancestry
+    // /31/, shallower) used to interleave with them because raw position was compared directly
+    // across unrelated original parents. Depth must win first: 45 before the whole 33-37 block,
+    // which stays contiguous and in original relative order since its own position IS comparable.
+    it('orders adopted siblings by original depth first, keeping true-sibling blocks contiguous and in order', () => {
+      const thirtyOne = sharedCollection({ id: 31, label: '31', ancestry: '/' });
+      const siblings = [33, 34, 35, 36, 37].map((id, index) => (
+        sharedCollection({ id, label: String(id), ancestry: '/31/32/', position: index + 1 })
+      ));
+      const fortyFive = sharedCollection({ id: 45, label: '45', ancestry: '/31/', position: 2 });
+
+      store.setSharedWithMeCollections([thirtyOne, fortyFive, ...siblings]);
+
+      const ownerRoot = store.shared_with_me_collections[0];
+      const node31 = ownerRoot.children[0];
+      expect(node31.id).toBe(31);
+      expect(node31.children.map((node) => node.id)).toEqual([45, 33, 34, 35, 36, 37]);
+    });
+
+    // The system collections became shareable, so the shared tree must stop dropping locked rows:
+    // the share is accepted server-side, and filtering it out here would leave the recipient with a
+    // share they can never see.
+    it('keeps a shared system collection in the tree', () => {
+      const shared_all = sharedCollection({ id: 7, label: 'All', ancestry: '/', is_locked: true });
+
+      store.setSharedWithMeCollections([shared_all]);
+
+      const ownerRoot = store.shared_with_me_collections[0];
+      expect(ownerRoot.children.map((node) => node.id)).toEqual([7]);
+    });
+
+    // The owner-grouping row is the one locked node the tree creates itself, and the render path
+    // tells it apart by the id 0 sentinel rather than by is_locked.
+    it('still groups under a synthetic owner row of its own', () => {
+      const shared_all = sharedCollection({ id: 7, label: 'All', ancestry: '/', is_locked: true });
+
+      store.setSharedWithMeCollections([shared_all]);
+
+      expect(store.shared_with_me_collections[0]).toHaveProperty('id', 0);
+      expect(store.shared_with_me_collections[0].label).toEqual('Alice');
+    });
+
+    it('roots a node under the owner when none of its ancestors are shared at all', () => {
+      const e = sharedCollection({ id: 5, label: 'E', ancestry: '/99/' });
+
+      store.setSharedWithMeCollections([e]);
+
+      const ownerRoot = store.shared_with_me_collections[0];
+      expect(ownerRoot.children.map((node) => node.id)).toEqual([5]);
+      expect(ownerRoot.children[0].ancestry).toEqual('/');
     });
   });
 });

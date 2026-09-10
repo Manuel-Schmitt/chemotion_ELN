@@ -62,8 +62,8 @@ module Chemotion
         end
 
         before do
-          collection = Collection.accessible_for(current_user).find(params[:ui_state][:collection_id])
-          @samples = Sample.by_collection_id(collection.id).by_ui_state(params[:ui_state])
+          @collection = Collection.accessible_for(current_user).find(params[:ui_state][:collection_id])
+          @samples = Sample.by_collection_id(@collection.id).by_ui_state(params[:ui_state])
           error!('401 Unauthorized', 401) unless ElementsPolicy.new(current_user, @samples).read_all?
         end
 
@@ -71,9 +71,14 @@ module Chemotion
         post do
           @samples = @samples.limit(params[:limit]) if params[:limit]
 
+          # All samples come from the single accessible collection @collection; apply its per-class
+          # detail levels so a restrictive share does not leak fields (molfile, analyses, etc.).
+          detail_levels = ElementDetailLevelCalculator.for_collection(collection: @collection, user: current_user)
+
           {
             samples: Entities::SampleEntity.represent(
               @samples,
+              detail_levels: detail_levels,
               root: false,
             ),
             literatures: Entities::LiteratureEntity.represent(
@@ -121,11 +126,13 @@ module Chemotion
             params[:file] = { tempfile: tempfile, filename: 'validated_data.csv' }
             tempfile.binmode
             CSV.open(tempfile, 'wb') do |csv|
-              # Add headers - get keys from the first row
-              first_row = params[:data].first
-              error!('Invalid data format: rows must be objects', 400) unless first_row.is_a?(Hash)
+              error!('Invalid data format: rows must be objects', 400) unless params[:data].all?(Hash)
 
-              headers = first_row.keys
+              # Union of every row's keys, in first-seen order. Taking them from the first row alone
+              # silently dropped every column that row happened not to carry -- for the whole file,
+              # not just that row -- so a mapping whose first row had no structure or sample id
+              # produced a CSV the importer then rejected with "Column headers should have: ...".
+              headers = params[:data].flat_map(&:keys).uniq
               csv << headers
               # Add data rows
               params[:data].each { |row| csv << headers.map { |header| row[header] } }
