@@ -1,0 +1,32 @@
+# Maps AD/LDAP groups to Chemotion ELN groups, kept in sync by LdapGroupSyncJob
+# (see config/initializers/ldap_group_sync.rb).
+#
+# On first boot, this example is copied to config/ad_group_sync.yml if that file does not exist
+# yet. Edit config/ad_group_sync.yml to change the behaviour of a running instance.
+#
+# `mappings` is a list, one entry per AD group <-> Chemotion group pair; add as many as needed:
+#   - ad_group_dn:     the AD/LDAP group's distinguished name. Nested group membership is
+#                      resolved automatically (see LdapMembershipCheck::NESTED_GROUP_MATCHING_RULE).
+#   - chemotion_group: the target Chemotion Group's name_abbreviation. The group must already
+#                      exist; unknown values are skipped with a warning, not created.
+#
+# Every ELN Person who is a (possibly nested) member of ad_group_dn is added to chemotion_group;
+# any current member of chemotion_group no longer in ad_group_dn is removed from it. Requires
+# LDAP_HOST/LDAP_BASE (see config/initializers/ldap_membership_check.rb) to be configured; runs
+# on the same schedule mechanism as LdapPeriodicRecheckJob (every even hour).
+#
+# Leave `mappings` empty to disable the sync entirely.
+
+development:
+  mappings: []
+
+test:
+  mappings: []
+
+production:
+  mappings: []
+  # mappings:
+  #   - ad_group_dn: cn=eln-chemists,ou=groups,dc=example,dc=org
+  #     chemotion_group: chemists
+  #   - ad_group_dn: cn=eln-biologists,ou=groups,dc=example,dc=org
+  #     chemotion_group: biologists

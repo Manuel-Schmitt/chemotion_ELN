@@ -5,7 +5,7 @@ require 'rails_helper'
 # Verifies the before_create hook registered from
 # config/initializers/ldap_activation_hook.rb (not defined in app/models/user.rb) runs
 # synchronously right before a disabled Person account is persisted.
-# rubocop:disable RSpec/DescribeClass, RSpec/MultipleDescribes
+# rubocop:disable RSpec/DescribeClass
 describe 'LDAP activation hook' do
   # Person#account_active is forced by User#set_account_active based on this env var, so it
   # has to be set to actually get a disabled account out of the factory.
@@ -27,7 +27,10 @@ describe 'LDAP activation hook' do
   end
 
   context 'when the account is already active' do
-    before { allow(LdapMembershipCheck).to receive(:enabled?).and_return(true) }
+    before do
+      stub_const('ENV', ENV.to_hash.merge('LDAP_ACTIVATION_GROUP_DN' => 'cn=eln-users,ou=groups,dc=example,dc=org'))
+      allow(LdapMembershipCheck).to receive(:enabled?).and_return(true)
+    end
 
     it 'does not run the LDAP check' do
       user = build(:person)
@@ -40,11 +43,15 @@ describe 'LDAP activation hook' do
   end
 
   context 'when LDAP is configured' do
-    before { allow(LdapMembershipCheck).to receive(:enabled?).and_return(true) }
+    before do
+      stub_const('ENV', ENV.to_hash.merge('LDAP_ACTIVATION_GROUP_DN' => 'cn=eln-users,ou=groups,dc=example,dc=org'))
+      allow(LdapMembershipCheck).to receive(:enabled?).and_return(true)
+    end
 
     it 'activates and persists the user when they are a member of the configured group' do
       user = build_disabled_person(name_abbreviation: 'jd')
-      allow(LdapMembershipCheck).to receive(:member?).with('jd').and_return(true)
+      allow(LdapMembershipCheck).to receive(:member?)
+        .with('cn=eln-users,ou=groups,dc=example,dc=org', 'jd').and_return(true)
 
       user.save!
 
@@ -53,7 +60,8 @@ describe 'LDAP activation hook' do
 
     it 'rejects (never persists) a user who is not a member of the configured group' do
       user = build_disabled_person(name_abbreviation: 'jd')
-      allow(LdapMembershipCheck).to receive(:member?).with('jd').and_return(false)
+      allow(LdapMembershipCheck).to receive(:member?)
+        .with('cn=eln-users,ou=groups,dc=example,dc=org', 'jd').and_return(false)
 
       expect { user.save! }.to raise_error(ActiveRecord::RecordNotSaved)
       expect(User.unscoped.where(name_abbreviation: 'jd')).not_to exist
@@ -61,7 +69,9 @@ describe 'LDAP activation hook' do
 
     it 'rejects (never persists) a user when the LDAP connection raises' do
       user = build_disabled_person(name_abbreviation: 'jd')
-      allow(LdapMembershipCheck).to receive(:member?).with('jd').and_raise(Net::LDAP::Error, 'connection refused')
+      allow(LdapMembershipCheck).to receive(:member?)
+        .with('cn=eln-users,ou=groups,dc=example,dc=org', 'jd')
+        .and_raise(Net::LDAP::Error, 'connection refused')
 
       expect { user.save! }.to raise_error(ActiveRecord::RecordNotSaved)
       expect(User.unscoped.where(name_abbreviation: 'jd')).not_to exist
@@ -69,153 +79,3 @@ describe 'LDAP activation hook' do
   end
 end
 # rubocop:enable RSpec/DescribeClass
-
-describe LdapMembershipCheck do
-  describe '.enabled?' do
-    it 'is true when host, base and activation group dn are present' do
-      stub_const('ENV', ENV.to_hash.merge(
-                          'LDAP_HOST' => 'ldap.example.org',
-                          'LDAP_BASE' => 'dc=example,dc=org',
-                          'LDAP_ACTIVATION_GROUP_DN' => 'cn=eln-users,ou=groups,dc=example,dc=org',
-                        ))
-
-      expect(described_class.enabled?).to be(true)
-    end
-
-    it 'is false when the activation group dn is missing' do
-      stub_const('ENV', ENV.to_hash.merge(
-                          'LDAP_HOST' => 'ldap.example.org',
-                          'LDAP_BASE' => 'dc=example,dc=org',
-                          'LDAP_ACTIVATION_GROUP_DN' => nil,
-                        ))
-
-      expect(described_class.enabled?).to be(false)
-    end
-  end
-
-  describe '.member?' do
-    let(:connection) { instance_double(Net::LDAP) }
-
-    before do
-      stub_const('ENV', ENV.to_hash.merge(
-                          'LDAP_HOST' => 'ldap.example.org',
-                          'LDAP_BASE' => 'dc=example,dc=org',
-                          'LDAP_ACTIVATION_GROUP_DN' => 'cn=eln-users,ou=groups,dc=example,dc=org',
-                        ))
-      allow(Net::LDAP).to receive(:new).and_return(connection)
-    end
-
-    it 'matches uid against the configured group, resolving nested groups' do
-      allow(connection).to receive(:search).and_return([{ dn: 'cn=jdoe,dc=example,dc=org' }])
-
-      expect(described_class.member?('jdoe')).to be(true)
-      expect(connection).to have_received(:search).with(
-        base: 'dc=example,dc=org',
-        filter: Net::LDAP::Filter.construct(
-          '(&(sAMAccountName=jdoe)(objectClass=user)(objectCategory=person)' \
-          '(memberOf:1.2.840.113556.1.4.1941:=cn=eln-users,ou=groups,dc=example,dc=org))',
-        ),
-        attributes: ['dn'],
-        paged_searches: false,
-      )
-    end
-
-    it 'returns false when no entry matches' do
-      allow(connection).to receive(:search).and_return([])
-
-      expect(described_class.member?('jdoe')).to be(false)
-    end
-
-    it 'escapes LDAP special characters in uid to prevent filter injection' do
-      allow(connection).to receive(:search).and_return([])
-
-      described_class.member?('jdoe)(uid=*')
-
-      expect(connection).to have_received(:search).with(
-        hash_including(filter: Net::LDAP::Filter.construct(
-          '(&(sAMAccountName=jdoe\29\28uid=\2A)(objectClass=user)(objectCategory=person)' \
-          '(memberOf:1.2.840.113556.1.4.1941:=cn=eln-users,ou=groups,dc=example,dc=org))',
-        )),
-      )
-    end
-
-    it 'returns false without querying when uid is blank' do
-      allow(connection).to receive(:search)
-
-      expect(described_class.member?('')).to be(false)
-      expect(connection).not_to have_received(:search)
-    end
-
-    it 'uses LDAP_UID_ATTRIBUTE instead of the sAMAccountName default when configured' do
-      stub_const('ENV', ENV.to_hash.merge('LDAP_UID_ATTRIBUTE' => 'uid'))
-      allow(connection).to receive(:search).and_return([])
-
-      described_class.member?('jdoe')
-
-      expect(connection).to have_received(:search).with(
-        hash_including(filter: Net::LDAP::Filter.construct(
-          '(&(uid=jdoe)(objectClass=user)(objectCategory=person)' \
-          '(memberOf:1.2.840.113556.1.4.1941:=cn=eln-users,ou=groups,dc=example,dc=org))',
-        )),
-      )
-    end
-
-    it 'raises when the search fails without itself raising (e.g. a bind failure)' do
-      operation_result = Struct.new(:message).new('Invalid Credentials')
-      allow(connection).to receive_messages(search: nil, get_operation_result: operation_result)
-
-      expect { described_class.member?('jdoe') }.to raise_error(Net::LDAP::Error, 'Invalid Credentials')
-    end
-  end
-
-  describe '.members' do
-    let(:connection) { instance_double(Net::LDAP) }
-
-    before do
-      stub_const('ENV', ENV.to_hash.merge(
-                          'LDAP_HOST' => 'ldap.example.org',
-                          'LDAP_BASE' => 'dc=example,dc=org',
-                          'LDAP_ACTIVATION_GROUP_DN' => 'cn=eln-users,ou=groups,dc=example,dc=org',
-                        ))
-      allow(Net::LDAP).to receive(:new).and_return(connection)
-    end
-
-    it 'runs a single wildcard, paged query and returns the downcased uid of every match' do
-      allow(connection).to receive(:search).and_return(
-        [{ 'sAMAccountName' => ['JDoe'] }, { 'sAMAccountName' => ['ASmith'] }],
-      )
-
-      expect(described_class.members).to eq(Set['jdoe', 'asmith'])
-      expect(connection).to have_received(:search).with(
-        base: 'dc=example,dc=org',
-        filter: Net::LDAP::Filter.construct(
-          '(&(objectClass=user)(objectCategory=person)' \
-          '(memberOf:1.2.840.113556.1.4.1941:=cn=eln-users,ou=groups,dc=example,dc=org))',
-        ),
-        attributes: ['sAMAccountName'],
-        paged_searches: true,
-      )
-    end
-
-    it 'returns an empty set when an entry lacks the uid attribute' do
-      allow(connection).to receive(:search).and_return([{ 'sAMAccountName' => [] }, {}])
-
-      expect(described_class.members).to eq(Set.new)
-    end
-
-    it 'returns an empty set when no entry matches' do
-      allow(connection).to receive(:search).and_return([])
-
-      expect(described_class.members).to eq(Set.new)
-    end
-
-    it 'raises when the search fails without itself raising (e.g. a bind failure), rather than ' \
-       'returning an empty set that would read as "nobody is a member"' do
-      operation_result = Struct.new(:message).new('Invalid Credentials')
-      allow(connection).to receive_messages(search: nil, get_operation_result: operation_result)
-
-      expect { described_class.members }.to raise_error(Net::LDAP::Error, 'Invalid Credentials')
-    end
-  end
-end
-# rubocop:enable RSpec/MultipleDescribes

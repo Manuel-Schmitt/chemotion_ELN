@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 # Periodically re-verifies every Person's LDAP/AD group membership and flips account_active accordingly:
-# Runs every even hour (00:00, 02:00, ... 22:00).
 # Applies to every Person
 # Self-registers as a delayed_cron_job recurring job.
 class LdapPeriodicRecheckJob < ApplicationJob
@@ -10,10 +9,10 @@ class LdapPeriodicRecheckJob < ApplicationJob
   CRON_SCHEDULE = '0 0-23/2 * * *' # every even hour, on the hour
 
   def perform
-    return unless LdapMembershipCheck.enabled?
+    return unless LdapMembershipCheck.enabled? && ENV['LDAP_ACTIVATION_GROUP_DN'].present?
 
     account_attribute = ENV['LDAP_ACCOUNT_ATTRIBUTE'].presence || 'name_abbreviation'
-    members = LdapMembershipCheck.members
+    members = LdapMembershipCheck.members(ENV.fetch('LDAP_ACTIVATION_GROUP_DN'))
     if members.blank?
       # A successful-but-empty result is indistinguishable from a misconfigured/renamed
       # LDAP_ACTIVATION_GROUP_DN; skip rather than risk deactivating every active Person.
@@ -38,7 +37,7 @@ class LdapPeriodicRecheckJob < ApplicationJob
   end
 end
 
-# Self-schedule via delayed_cron_job's cron support 
+# Self-schedule via delayed_cron_job's cron support
 ActiveSupport.on_load(:active_record) do
   next unless ActiveRecord::Base.connection.table_exists?('delayed_jobs') && Delayed::Job.column_names.include?('cron')
 

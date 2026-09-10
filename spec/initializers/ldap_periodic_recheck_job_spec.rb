@@ -32,7 +32,10 @@ describe LdapPeriodicRecheckJob do
     end
 
     context 'when LDAP is configured' do
-      before { allow(LdapMembershipCheck).to receive(:enabled?).and_return(true) }
+      before do
+        stub_const('ENV', ENV.to_hash.merge('LDAP_ACTIVATION_GROUP_DN' => 'cn=eln-users,ou=groups,dc=example,dc=org'))
+        allow(LdapMembershipCheck).to receive(:enabled?).and_return(true)
+      end
 
       it 'activates a disabled Person who now satisfies the filter' do
         user = create_disabled_person(name_abbreviation: 'jd')
@@ -45,7 +48,7 @@ describe LdapPeriodicRecheckJob do
 
       it 'disables an active Person who no longer satisfies the filter' do
         user = create(:person, account_active: true, name_abbreviation: 'jd')
-        allow(LdapMembershipCheck).to receive(:members).and_return(Set.new)
+        allow(LdapMembershipCheck).to receive(:members).and_return(Set['someoneelse'])
 
         described_class.new.perform
 
