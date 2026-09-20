@@ -8,6 +8,22 @@ module Chemotion
         error!(message, 404)
       end
 
+      helpers do
+        # Non-raising lookup shared by the single and batch code-resolution endpoints.
+        def resolve_code_log(code)
+          size = code&.size || 0
+          if size >= 39
+            CodeLog.find_by(id: CodeCreator.digit_to_uuid(code))
+          elsif size >= 8
+            # TODO: use where instead of find_by ?
+            CodeLog.where('value ~ ?', "\\A0#{code}").first
+          elsif size == 6
+            # TODO: use where instead of find_by ?
+            CodeLog.find_by(value_xs: code.to_i)
+          end
+        end
+      end
+
       # desc "Delete code logs by analysis ID"
       # params do
       #   requires :analysis_id, type: String, desc: "Analysis ID"
@@ -25,23 +41,33 @@ module Chemotion
           requires :code, type: String, regexp: /\A\d{6,40}\Z/
         end
         get do
-          code = params[:code]
-          s = code&.size || 0
-          code_log =
-            if s >= 39
-              CodeLog.find(CodeCreator.digit_to_uuid(code))
-            elsif s >= 8
-              # TODO: use where instead of find_by ?
-              CodeLog.where('value ~ ?', "\\A0#{code}").first
-            elsif s == 6
-              # TODO: use where instead of find_by ?
-              CodeLog.find_by(value_xs: code.to_i)
-            end
+          code_log = resolve_code_log(params[:code])
 
           if code_log.nil?
-            error!("Element with #{code.size}-digit code #{params[:code]} not found", 404)
+            error!("Element with #{params[:code].size}-digit code #{params[:code]} not found", 404)
           else
             present code_log, with: Entities::CodeLogEntity, root: :code_log
+          end
+        end
+      end
+
+      namespace :generic_batch do
+        desc 'Return code logs for a batch of qr/bar codes (e.g. from a multi-code paste)'
+        params do
+          requires :codes, type: [String]
+        end
+        post do
+          params[:codes].uniq.map do |code|
+            if code.match?(/\A\d{6,40}\Z/)
+              code_log = resolve_code_log(code)
+              if code_log.nil?
+                { code: code, error: "Element with #{code.size}-digit code #{code} not found" }
+              else
+                { code: code, code_log: Entities::CodeLogEntity.represent(code_log).as_json }
+              end
+            else
+              { code: code, error: 'Invalid code format' }
+            end
           end
         end
       end
