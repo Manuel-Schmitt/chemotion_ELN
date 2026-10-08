@@ -12,6 +12,7 @@ import CodeLogsFetcher from 'src/fetchers/CodeLogsFetcher';
 import SearchFetcher from 'src/fetchers/SearchFetcher';
 
 const SCAN_FORMATS = ['qr_code', 'code_128', 'ean_13', 'ean_8', 'data_matrix'];
+const CODE_LOOKUP_CONCURRENCY = 5;
 
 // Maps a code_log `source` to the model_name/result key expected by the search-by-ids API.
 const MODEL_INFO_BY_SOURCE = {
@@ -55,10 +56,16 @@ const ScanCodeButton = () => {
   const [scanError, setScanError] = useState(null);
   const [multiScan, setMultiScan] = useState(false);
   const [scannedItems, setScannedItems] = useState([]);
+  const [isResolvingCodes, setIsResolvingCodes] = useState(false);
   const codeInput = useRef(null);
   const seenKeysRef = useRef(new Set());
+  const lookupSessionRef = useRef(0);
+  const resolvingCodesRef = useRef(false);
 
   const resetSession = () => {
+    lookupSessionRef.current += 1;
+    resolvingCodesRef.current = false;
+    setIsResolvingCodes(false);
     setScannedItems([]);
     seenKeysRef.current = new Set();
   };
@@ -124,6 +131,7 @@ const ScanCodeButton = () => {
   };
 
   const handleScan = (code) => {
+    if (resolvingCodesRef.current) return;
     const dataInput = codeInput.current?.value || code;
     if (!dataInput) return;
 
@@ -142,22 +150,41 @@ const ScanCodeButton = () => {
       });
   };
 
-  const handleManualBatchAdd = () => {
+  const handleManualBatchAdd = async () => {
+    if (resolvingCodesRef.current) return;
     const raw = codeInput.current?.value || '';
-    const codes = splitManualCodes(raw);
+    const codes = [...new Set(splitManualCodes(raw))];
     if (codes.length === 0) return;
 
-    CodeLogsFetcher.fetchGenericCodeLogsBatch(codes)
-      .then((results) => {
-        results.forEach((result) => {
-          if (result.code_log) addResolvedCodeLog(result.code, result.code_log);
-        });
-        const failed = results.filter((result) => result.error);
-        setScanError(failed.length > 0 ? `${failed.length} code(s) could not be resolved.` : null);
-      })
-      .catch((errorMessage) => setScanError(errorMessage.message));
-
+    const session = lookupSessionRef.current;
+    resolvingCodesRef.current = true;
+    setIsResolvingCodes(true);
+    setScanError(null);
     if (codeInput.current) codeInput.current.value = '';
+
+    const failures = [];
+    for (let offset = 0; offset < codes.length; offset += CODE_LOOKUP_CONCURRENCY) {
+      const chunk = codes.slice(offset, offset + CODE_LOOKUP_CONCURRENCY);
+      const results = await Promise.allSettled(
+        chunk.map((code) => CodeLogsFetcher.fetchGenericCodeLogs(code))
+      );
+      if (session !== lookupSessionRef.current) return;
+
+      results.forEach((result, index) => {
+        const code = chunk[index];
+        if (result.status === 'fulfilled') {
+          addResolvedCodeLog(code, result.value.code_log);
+        } else {
+          failures.push(`${code}: ${result.reason?.message || 'Could not resolve code.'}`);
+        }
+      });
+    }
+
+    resolvingCodesRef.current = false;
+    setIsResolvingCodes(false);
+    setScanError(failures.length > 0
+      ? `${failures.length} code(s) could not be resolved. ${failures.join('; ')}`
+      : null);
   };
 
   const handleScanResult = (results) => {
@@ -219,12 +246,12 @@ const ScanCodeButton = () => {
 
   let primaryActionLabel = 'Start scanning';
   let onPrimaryAction = () => setShowScanner(true);
-  let primaryActionDisabled = false;
+  let primaryActionDisabled = isResolvingCodes;
   if (showScanner && multiScan) {
     const count = scannedItems.length;
     primaryActionLabel = `Done \u2014 show ${count} result${count === 1 ? '' : 's'}`;
     onPrimaryAction = finalizeMultiScan;
-    primaryActionDisabled = count === 0;
+    primaryActionDisabled = count === 0 || isResolvingCodes;
   } else if (showScanner) {
     primaryActionLabel = undefined;
     onPrimaryAction = undefined;
@@ -255,6 +282,7 @@ const ScanCodeButton = () => {
             id="multi-scan-toggle"
             label="Scan multiple codes"
             checked={multiScan}
+            disabled={isResolvingCodes}
             onChange={(e) => setMultiScan(e.target.checked)}
             className="me-auto"
           />
@@ -272,6 +300,7 @@ const ScanCodeButton = () => {
                 type="text"
                 placeholder={multiScan ? 'Or paste/enter multiple codes...' : 'Or enter code manually...'}
                 ref={codeInput}
+                disabled={isResolvingCodes}
                 onKeyDown={handleKeyPress}
               />
             </Form.Group>
@@ -326,10 +355,12 @@ const ScanCodeButton = () => {
         {scanError && (
           <Alert variant="danger" className="mt-2">{scanError}</Alert>
         )}
+        {isResolvingCodes && (
+          <Alert variant="info" className="mt-2">Resolving pasted codes...</Alert>
+        )}
       </AppModal>
     </>
   );
 };
 
 export default ScanCodeButton;
-
