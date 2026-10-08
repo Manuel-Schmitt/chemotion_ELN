@@ -8,17 +8,6 @@ module Chemotion
         error!(message, 404)
       end
 
-      # desc "Delete code logs by analysis ID"
-      # params do
-      #   requires :analysis_id, type: String, desc: "Analysis ID"
-      # end
-      # route_param :analysis_id do
-      #   delete do
-      #     code_logs = CodeLog.where(analysis_id: params[:analysis_id])
-      #     code_logs.destroy_all
-      #   end
-      # end
-
       namespace :generic do
         desc 'Return code log by qr code'
         params do
@@ -33,32 +22,14 @@ module Chemotion
             elsif s >= 8
               # TODO: use where instead of find_by ?
               CodeLog.where('value ~ ?', "\\A0#{code}").first
+            else
+              # Shorter code snippet searches increase the chance of collisions, which are not handled at the moment. 
+              error!('Code search needs at least 8 digits', 400)
             end
           if code_log.nil?
             error!("Element with #{params[:code].size}-digit code #{params[:code]} not found", 404)
           else
             present code_log, with: Entities::CodeLogEntity, root: :code_log
-          end
-        end
-      end
-
-      namespace :generic_batch do
-        desc 'Return code logs for a batch of qr/bar codes (e.g. from a multi-code paste)'
-        params do
-          requires :codes, type: [String]
-        end
-        post do
-          params[:codes].uniq.map do |code|
-            if code.match?(/\A\d{6,40}\Z/)
-              code_log = resolve_code_log(code)
-              if code_log.nil?
-                { code: code, error: "Element with #{code.size}-digit code #{code} not found" }
-              else
-                { code: code, code_log: Entities::CodeLogEntity.represent(code_log).as_json }
-              end
-            else
-              { code: code, error: 'Invalid code format' }
-            end
           end
         end
       end
