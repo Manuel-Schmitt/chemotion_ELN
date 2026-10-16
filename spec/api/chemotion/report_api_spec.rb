@@ -793,6 +793,51 @@ describe Chemotion::ReportAPI do
         expect(response['Content-Type']).to eq('text/csv')
       end
 
+      context 'with a purification solvent in the reaction' do
+        # the solvent and the purification solvent get their own structures,
+        # so that each role can be told apart in the exported smiles
+        let(:sample2) do
+          build(:sample, created_by: user.id, molfile: build(:molfile, type: :aromtic_2sub),
+                         collections: [collection])
+        end
+        let!(:purification_solvent) do
+          create(:sample, created_by: user.id, molfile: build(:molfile, type: :water), collections: [collection])
+        end
+        let(:purification_smiles) { purification_solvent.molecule.cano_smiles }
+
+        before do
+          create(:reactions_purification_solvent_sample, reaction: reaction, sample: purification_solvent)
+        end
+
+        it 'exports the reaction smiles without the purification solvent (SM>R>S>P)' do
+          post('/api/v1/reports/export_reactions_from_selections',
+               params: params.merge(exportType: 5).to_json,
+               headers: {
+                 'HTTP_ACCEPT' => 'text/plain, text/csv',
+                 'CONTENT-TYPE' => 'application/json',
+               })
+
+          expect(response).to have_http_status(:created)
+          expect(response.body).to eq(
+            "#{[smiles0, smiles1].join('.')}>#{smiles3}>#{smiles2}>#{smiles4}",
+          )
+        end
+
+        it 'leaves the purification solvent out of every role' do
+          smiles_by_role = result.fetch(reaction.id.to_s)
+
+          # reactant, solvent and purification solvent are three distinct structures
+          expect([smiles3, smiles2, purification_smiles].uniq.size).to eq(3)
+          expect(smiles_by_role).to eq(
+            '0' => [smiles0, smiles1],
+            '1' => [smiles3],
+            '2' => [smiles2],
+            '3' => [smiles4],
+          )
+          expect(smiles_by_role.values.flatten).not_to include(purification_smiles)
+        end
+      end
+
       describe 'ReportHelpers' do
         it 'concats the smiles SM>>P' do
           expect(subj.r_smiles_0(result.first.second)).to eq(
@@ -968,6 +1013,39 @@ describe Chemotion::ReportAPI do
         params[:template] = 'supporting_information'
         post '/api/v1/reports', params: params, as: :json
         expect(response.body).to include(filename)
+      end
+
+      context 'with the template selected in the UI' do
+        let(:report_template) { create(:report_template, report_type: 'supporting_information') }
+
+        it 'stores the report type of the selected template' do
+          post '/api/v1/reports', params: params.merge(templateId: report_template.id), as: :json
+          expect(Report.last).to have_attributes(
+            report_templates_id: report_template.id, template: 'supporting_information',
+          )
+        end
+
+        it 'lists the archive with the stored template id and its report type' do
+          report_template.update!(report_type: 'rxn_list_xlsx')
+          post '/api/v1/reports', params: params.merge(templateId: report_template.id), as: :json
+          get '/api/v1/archives/all'
+          archive = JSON.parse(response.body)['archives'].find { |a| a['id'] == Report.last.id }
+          expect(archive).to include('template' => report_template.id, 'report_type' => 'rxn_list_xlsx')
+        end
+      end
+
+      context 'with a cloned archive that has no stored template' do
+        it 'stores the report type sent as templateId' do
+          post '/api/v1/reports', params: params.merge(templateId: 'supporting_information'), as: :json
+          expect(Report.last).to have_attributes(report_templates_id: nil, template: 'supporting_information')
+        end
+      end
+
+      context 'with an unknown template id' do
+        it 'falls back to templateType' do
+          post '/api/v1/reports', params: params.merge(templateId: '0', templateType: 'spectrum'), as: :json
+          expect(Report.last).to have_attributes(report_templates_id: nil, template: 'spectrum')
+        end
       end
     end
 
