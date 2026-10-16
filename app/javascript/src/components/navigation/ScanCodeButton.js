@@ -1,81 +1,34 @@
-import React, { useState, useRef } from 'react';
-import {
-  Alert, Badge, Button, Form, Stack
-} from 'react-bootstrap';
+import React, { useState, useRef, useContext } from 'react';
+import { Alert, Button, Form } from 'react-bootstrap';
 import { Scanner } from '@yudiel/react-qr-scanner';
+import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
 import AppModal from 'src/components/common/AppModal';
 import UIActions from 'src/stores/alt/actions/UIActions';
-import ElementActions from 'src/stores/alt/actions/ElementActions';
-import UIStore from 'src/stores/alt/stores/UIStore';
 import Aviator from 'aviator';
 import CodeLogsFetcher from 'src/fetchers/CodeLogsFetcher';
 import SearchFetcher from 'src/fetchers/SearchFetcher';
+import { StoreContext } from 'src/stores/mobx/RootStore';
+import { ALL_LABEL } from 'src/stores/mobx/CollectionsStore';
+import { byIdsModelParams } from 'src/utilities/searchRequestParams';
 
 const SCAN_FORMATS = ['qr_code', 'code_128', 'ean_13', 'ean_8', 'data_matrix'];
-const CODE_LOOKUP_CONCURRENCY = 5;
-
-// Maps a code_log `source` to the model_name/result key expected by the search-by-ids API.
-const MODEL_INFO_BY_SOURCE = {
-  sample: { modelName: 'sample', resultKey: 'samples' },
-  reaction: { modelName: 'reaction', resultKey: 'reactions' },
-  wellplate: { modelName: 'wellplate', resultKey: 'wellplates' },
-  screen: { modelName: 'screen', resultKey: 'screens' },
-  research_plan: { modelName: 'research_plan', resultKey: 'research_plans' },
-  device_description: { modelName: 'device_description', resultKey: 'device_descriptions' },
-  sequence_based_macromolecule_sample: {
-    modelName: 'sequence_based_macromolecule_sample',
-    resultKey: 'sequence_based_macromolecule_samples',
-  },
-  cellline_sample: { modelName: 'cell_lines', resultKey: 'cell_lines' },
-  vessel: { modelName: 'vessel', resultKey: 'vessels' },
-};
-
-const modelInfoForSource = (source) => (
-  MODEL_INFO_BY_SOURCE[source] || { modelName: 'element', resultKey: 'elements' }
-);
-
-// Splits a pasted/typed batch of codes on any non-digit separator (space, comma, newline, ...).
-const splitManualCodes = (raw) => raw.match(/\d{6,40}/g) || [];
-
-const buildByIdsSelection = (modelName, ids, pageSize) => ({
-  elementType: 'by_ids',
-  id_params: {
-    model_name: modelName,
-    ids,
-    total_elements: ids.length,
-    with_filter: false,
-  },
-  list_filter_params: {},
-  search_by_method: 'search_by_ids',
-  page_size: pageSize,
-});
 
 const ScanCodeButton = () => {
+  const collectionsStore = useContext(StoreContext).collections;
   const [showModal, setShowModal] = useState(false);
   const [showScanner, setShowScanner] = useState(false);
   const [scanError, setScanError] = useState(null);
   const [multiScan, setMultiScan] = useState(false);
-  const [scannedItems, setScannedItems] = useState([]);
-  const [isResolvingCodes, setIsResolvingCodes] = useState(false);
+  const [scanResults, setScanResults] = useState({ items: [], info: null });
+  const { items: scannedItems, info: scanInfo } = scanResults;
   const codeInput = useRef(null);
-  const seenKeysRef = useRef(new Set());
-  const lookupSessionRef = useRef(0);
-  const resolvingCodesRef = useRef(false);
-
-  const resetSession = () => {
-    lookupSessionRef.current += 1;
-    resolvingCodesRef.current = false;
-    setIsResolvingCodes(false);
-    setScannedItems([]);
-    seenKeysRef.current = new Set();
-  };
 
   const close = () => {
     setShowModal(false);
     setShowScanner(false);
     setScanError(null);
     setMultiScan(false);
-    resetSession();
+    setScanResults({ items: [], info: null });
   };
 
   const navigateToSingleResult = (codeLog) => {
@@ -91,100 +44,73 @@ const ScanCodeButton = () => {
     close();
   };
 
-  // Adds a resolved code_log to the running multi-scan list and fetches its display name.
-  const addResolvedCodeLog = (code, codeLog) => {
-    // Analysis (container) codes are added as their root element, same as single-scan navigation.
-    const target = codeLog.source === 'container' ? codeLog.root_code : codeLog;
-    const { modelName, resultKey } = modelInfoForSource(target.source);
-    const itemKey = `${modelName}-${target.source_id}`;
+  const addResolvedCodeLog = async (code, codeLog) => {
+    if (codeLog?.source === 'container') {
+      throw new Error('Multi scan does not support analysis container codes.');
+    }
 
-    if (seenKeysRef.current.has(itemKey)) return;
-    seenKeysRef.current.add(itemKey);
+    const { model_name: modelName } = byIdsModelParams(codeLog.source);
+    if (modelName === 'element' && codeLog.source !== 'element') {
+      throw new Error(`Unsupported ELN entity type: ${codeLog.source}.`);
+    }
 
-    setScannedItems((items) => [...items, {
-      itemKey,
-      code,
-      source: target.source,
-      sourceId: target.source_id,
-      modelName,
-      resultKey,
-      label: `${target.source.replace(/_/g, ' ')} #${target.source_id}`,
-      status: 'loading',
-    }]);
-
-    const { currentCollection } = UIStore.getState();
-    const selection = buildByIdsSelection(modelName, [target.source_id], 1);
-
-    SearchFetcher.fetchBasedOnSearchResultIds({
-      selection, collectionId: currentCollection?.id, page: 1, moleculeSort: false,
-    }).then((result) => {
-      const element = result?.[resultKey]?.elements?.[0];
-      const label = (element?.title && element.title()) || element?.name;
-      setScannedItems((items) => items.map((item) => (
-        item.itemKey === itemKey ? { ...item, status: 'resolved', label: label || item.label } : item
-      )));
-    }).catch(() => {
-      setScannedItems((items) => items.map((item) => (
-        item.itemKey === itemKey ? { ...item, status: 'error' } : item
-      )));
+    const allCollection = collectionsStore.systemCollections.find(
+      (collection) => collection.is_locked && collection.label === ALL_LABEL
+    );
+    if (allCollection?.id == null) {
+      throw new Error('Your All collection is not available yet.');
+    }
+    const result = await SearchFetcher.fetchBasedOnSearchResultIds({
+      selection: {
+        elementType: 'by_ids',
+        id_params: {
+          model_name: modelName,
+          ids: [codeLog.source_id],
+          total_elements: 1,
+          with_filter: false,
+        },
+        list_filter_params: {},
+        search_by_method: 'search_by_ids',
+        page_size: 1,
+      },
+      collectionId: allCollection.id,
+      page: 1,
+      moleculeSort: false,
     });
+    const entity = Object.values(result || {})
+      .flatMap((group) => (Array.isArray(group?.elements) ? group.elements : []))
+      .find((item) => String(item.id) === String(codeLog.source_id));
+    if (!entity) {
+      const sourceLabel = codeLog.source.replace(/_/g, ' ');
+      throw new Error(`Could not load ${sourceLabel} #${codeLog.source_id} in your All collection.`);
+    }
+    setScanResults(({ items }) => {
+      const alreadyScanned = items.some(
+        (item) => item.source === codeLog.source && String(item.entity.id) === String(entity.id)
+      );
+      return alreadyScanned
+        ? { items, info: 'This item has already been scanned.' }
+        : { items: [...items, { code, source: codeLog.source, entity }], info: null };
+    });
+    return entity;
   };
 
   const handleScan = (code) => {
-    if (resolvingCodesRef.current) return;
-    const dataInput = codeInput.current?.value || code;
-    if (!dataInput) return;
-
-    CodeLogsFetcher.fetchGenericCodeLogs(dataInput)
-      .then((json) => {
+    if (!code) return;
+    CodeLogsFetcher.fetchGenericCodeLogs(code)
+      .then(async (json) => {
         const { code_log: codeLog } = json;
         if (multiScan) {
-          addResolvedCodeLog(dataInput, codeLog);
-          if (codeInput.current) codeInput.current.value = '';
-        } else {
-          navigateToSingleResult(codeLog);
+          await addResolvedCodeLog(code, codeLog);
+          setScanError(null);
+          return;
         }
+        navigateToSingleResult(codeLog);
       })
       .catch((errorMessage) => {
         setScanError(errorMessage.message);
+        setScanResults((current) => ({ ...current, info: null }));
       });
-  };
-
-  const handleManualBatchAdd = async () => {
-    if (resolvingCodesRef.current) return;
-    const raw = codeInput.current?.value || '';
-    const codes = [...new Set(splitManualCodes(raw))];
-    if (codes.length === 0) return;
-
-    const session = lookupSessionRef.current;
-    resolvingCodesRef.current = true;
-    setIsResolvingCodes(true);
-    setScanError(null);
-    if (codeInput.current) codeInput.current.value = '';
-
-    const failures = [];
-    for (let offset = 0; offset < codes.length; offset += CODE_LOOKUP_CONCURRENCY) {
-      const chunk = codes.slice(offset, offset + CODE_LOOKUP_CONCURRENCY);
-      const results = await Promise.allSettled(
-        chunk.map((code) => CodeLogsFetcher.fetchGenericCodeLogs(code))
-      );
-      if (session !== lookupSessionRef.current) return;
-
-      results.forEach((result, index) => {
-        const code = chunk[index];
-        if (result.status === 'fulfilled') {
-          addResolvedCodeLog(code, result.value.code_log);
-        } else {
-          failures.push(`${code}: ${result.reason?.message || 'Could not resolve code.'}`);
-        }
-      });
-    }
-
-    resolvingCodesRef.current = false;
-    setIsResolvingCodes(false);
-    setScanError(failures.length > 0
-      ? `${failures.length} code(s) could not be resolved. ${failures.join('; ')}`
-      : null);
   };
 
   const handleScanResult = (results) => {
@@ -195,67 +121,13 @@ const ScanCodeButton = () => {
 
   const handleKeyPress = (e) => {
     const code = e.keyCode || e.which;
-    if (code !== 13) return;
-    e.preventDefault();
-    if (multiScan) {
-      handleManualBatchAdd();
-    } else {
-      handleScan();
+    if (code === 13) {
+      e.preventDefault();
+      handleScan(codeInput.current?.value);
     }
   };
 
-  const removeScannedItem = (itemKey) => {
-    seenKeysRef.current.delete(itemKey);
-    setScannedItems((items) => items.filter((item) => item.itemKey !== itemKey));
-  };
-
-  // Groups all scanned elements by type and loads them via the existing search-by-ids pipeline
-  // (the same one Advanced Search's "Adopt result" uses), so results render as combined tabs.
-  const finalizeMultiScan = () => {
-    const { currentCollection, number_of_results: pageSize } = UIStore.getState();
-    if (!currentCollection?.id) {
-      setScanError('Please select a collection first.');
-      return;
-    }
-
-    const idsByGroup = {};
-    scannedItems.forEach((item) => {
-      idsByGroup[item.resultKey] ||= { modelName: item.modelName, ids: [] };
-      idsByGroup[item.resultKey].ids.push(item.sourceId);
-    });
-
-    const fetches = Object.values(idsByGroup).map(({ modelName, ids }) => SearchFetcher
-      .fetchBasedOnSearchResultIds({
-        selection: buildByIdsSelection(modelName, ids, pageSize),
-        collectionId: currentCollection.id,
-        page: 1,
-        moleculeSort: false,
-      }));
-
-    Promise.all(fetches)
-      .then((groupResults) => {
-        const combined = Object.assign({}, ...groupResults);
-        UIActions.setSearchById(combined);
-        ElementActions.dispatchSearchResult(combined);
-        close();
-      })
-      .catch((errorMessage) => {
-        setScanError(errorMessage.message || 'Could not load the scanned elements.');
-      });
-  };
-
-  let primaryActionLabel = 'Start scanning';
-  let onPrimaryAction = () => setShowScanner(true);
-  let primaryActionDisabled = isResolvingCodes;
-  if (showScanner && multiScan) {
-    const count = scannedItems.length;
-    primaryActionLabel = `Done \u2014 show ${count} result${count === 1 ? '' : 's'}`;
-    onPrimaryAction = finalizeMultiScan;
-    primaryActionDisabled = count === 0 || isResolvingCodes;
-  } else if (showScanner) {
-    primaryActionLabel = undefined;
-    onPrimaryAction = undefined;
-  }
+  const isMultiScanRunning = multiScan && showScanner;
 
   return (
     <>
@@ -272,91 +144,119 @@ const ScanCodeButton = () => {
         show={showModal}
         onHide={close}
         title="Scan barcode or QR code"
-        size={multiScan ? 'lg' : undefined}
-        primaryActionLabel={primaryActionLabel}
-        onPrimaryAction={onPrimaryAction}
-        primaryActionDisabled={primaryActionDisabled}
+        style={{ '--bs-modal-width': multiScan ? '1000px' : '500px' }}
+        dialogClassName="scan-code-modal-dialog"
+        primaryActionLabel={isMultiScanRunning ? 'Done' : 'Start scanning'}
+        onPrimaryAction={isMultiScanRunning ? close : () => setShowScanner(true)}
+        primaryActionDisabled={isMultiScanRunning && scannedItems.length === 0}
         extendedFooter={(
           <Form.Check
             type="switch"
             id="multi-scan-toggle"
             label="Scan multiple codes"
             checked={multiScan}
-            disabled={isResolvingCodes}
             onChange={(e) => setMultiScan(e.target.checked)}
             className="me-auto"
           />
         )}
       >
-        <div className="d-flex gap-3">
-          <div
-            id="code-scanner"
-            className="flex-grow-1"
-            style={{ maxHeight: '600px', overflow: 'hidden', minWidth: 0 }}
+        <PanelGroup
+          key={multiScan ? 'multi-scan' : 'single-scan'}
+          direction="horizontal"
+          style={{ height: 'auto' }}
+        >
+          <Panel
+            id="scan-code-scanner-panel"
+            order={1}
+            defaultSize={multiScan ? 50 : 100}
+            minSize={20}
           >
-            <Form.Group className="mb-2">
-              <Form.Control
-                autoFocus
-                type="text"
-                placeholder={multiScan ? 'Or paste/enter multiple codes...' : 'Or enter code manually...'}
-                ref={codeInput}
-                disabled={isResolvingCodes}
-                onKeyDown={handleKeyPress}
-              />
-            </Form.Group>
+            <div
+              id="code-scanner"
+              className="flex-grow-1"
+              style={{ minWidth: 0 }}
+            >
+              <Form.Group className="mb-2">
+                <Form.Control
+                  autoFocus
+                  type="text"
+                  placeholder="Or enter code manually..."
+                  ref={codeInput}
+                  onKeyDown={handleKeyPress}
+                />
+              </Form.Group>
 
-            {showScanner && (
-              <Scanner
-                onScan={handleScanResult}
-                onError={(err) => console.error(err)}
-                formats={SCAN_FORMATS}
-                styles={{ container: { width: '100%' } }}
-              />
-            )}
-          </div>
+              {showScanner && (
+                <Scanner
+                  onScan={handleScanResult}
+                  onError={(err) => console.error(err)}
+                  formats={SCAN_FORMATS}
+                  styles={{
+                    container: {
+                      width: '100%',
+                      maxWidth: 'min(600px, calc(70vh - 6rem))',
+                      height: 'auto',
+                      aspectRatio: '1 / 1',
+                      marginInline: 'auto',
+                    },
+                    video: {
+                      position: 'absolute',
+                      inset: 0,
+                      objectPosition: 'center',
+                    },
+                  }}
+                />
+              )}
+            </div>
+          </Panel>
 
           {multiScan && (
-            <div
-              className="scanned-items-list flex-shrink-0"
-              style={{ width: 260, maxHeight: 550, overflowY: 'auto' }}
-            >
-              <strong>{`Scanned (${scannedItems.length})`}</strong>
-              {scannedItems.length === 0 && (
-                <div className="text-muted small mt-2">No codes scanned yet.</div>
-              )}
-              <Stack gap={1} className="mt-2">
-                {scannedItems.map((item) => (
-                  <div
-                    key={item.itemKey}
-                    className="d-flex align-items-center justify-content-between border rounded px-2 py-1"
-                  >
-                    <span className="text-truncate">
-                      <Badge bg="secondary" className="me-2">{item.source}</Badge>
-                      {item.status === 'loading' ? 'Resolving...' : item.label}
-                      {item.status === 'error' && (
-                        <span className="text-danger ms-1">(name lookup failed)</span>
-                      )}
-                    </span>
-                    <Button
-                      variant="link"
-                      size="sm"
-                      className="p-0 ms-2"
-                      onClick={() => removeScannedItem(item.itemKey)}
-                    >
-                      <i className="fa fa-times" />
-                    </Button>
-                  </div>
-                ))}
-              </Stack>
-            </div>
+            <>
+              <PanelResizeHandle
+                className="d-flex align-items-center justify-content-center bg-light"
+                aria-label="Resize scanner and scanned items"
+                style={{ width: 16, minHeight: 84, cursor: 'col-resize' }}
+              >
+                <span
+                  aria-hidden="true"
+                  className="bg-secondary rounded"
+                  style={{ width: 4, height: 32 }}
+                />
+              </PanelResizeHandle>
+              <Panel
+                id="scan-code-list-panel"
+                order={2}
+                defaultSize={50}
+                minSize={20}
+              >
+                <div
+                  className="scanned-items-list"
+                  style={{ maxHeight: 550, overflowY: 'auto' }}
+                >
+                  <strong>{`Scanned (${scannedItems.length})`}</strong>
+                  {scannedItems.length === 0 && (
+                    <div className="text-muted small mt-2">No codes scanned yet.</div>
+                  )}
+                  <ul className="list-unstyled mt-2 mb-0">
+                    {scannedItems.map(({ source, entity }, index) => (
+                      // Entries are append-only until the list is cleared.
+                      // eslint-disable-next-line react/no-array-index-key
+                      <li key={index} className="border-bottom py-2">
+                        {`${source.replace(/_/g, ' ')} #${entity.id}`}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </Panel>
+            </>
           )}
-        </div>
+        </PanelGroup>
 
+        {multiScan && scanInfo && (
+          <Alert variant="info" className="mt-2">{scanInfo}</Alert>
+        )}
         {scanError && (
           <Alert variant="danger" className="mt-2">{scanError}</Alert>
-        )}
-        {isResolvingCodes && (
-          <Alert variant="info" className="mt-2">Resolving pasted codes...</Alert>
         )}
       </AppModal>
     </>
