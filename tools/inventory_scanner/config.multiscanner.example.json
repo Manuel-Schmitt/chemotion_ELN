@@ -1,0 +1,22 @@
+{
+  "base_url": "https://chemotion.example.org",
+  "station_name": "Lab inventory station",
+  "timeout": 15,
+  "pair_timeout": 60,
+  "fullscreen": true,
+  "scanner_backend": "zebra_ssi",
+  "scanner_baudrate": 9600,
+  "scanner_timeout": 2,
+  "scanners": [
+    {
+      "id": "blue",
+      "name": "Blue scanner",
+      "port": "/dev/serial/by-id/REPLACE_WITH_BLUE_CRADLE"
+    },
+    {
+      "id": "orange",
+      "name": "Orange scanner",
+      "port": "/dev/serial/by-id/REPLACE_WITH_ORANGE_CRADLE"
+    }
+  ]
+}

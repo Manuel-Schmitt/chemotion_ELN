@@ -1,0 +1,1 @@
+"""Standalone chemotion inventory station."""

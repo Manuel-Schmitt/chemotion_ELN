@@ -1,0 +1,4 @@
+pylibdmtx>=0.1.10,<0.2
+pyserial>=3.5,<4
+# pylibdmtx imports distutils, removed from the standard library in Python 3.12.
+setuptools>=70,<83; python_version >= "3.12"

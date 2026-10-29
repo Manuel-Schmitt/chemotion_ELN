@@ -1,0 +1,12 @@
+{
+  "base_url": "https://chemotion.example.org",
+  "station_name": "Lab inventory station",
+  "timeout": 15,
+  "pair_timeout": 60,
+  "fullscreen": true,
+  "scanner_backend": "keyboard",
+  "scanner_port": "",
+  "scanner_baudrate": 9600,
+  "scanner_timeout": 2,
+  "scanners": []
+}
